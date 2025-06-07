@@ -1,3 +1,8 @@
+[![go build](https://github.com/0x5844/pqcGO/actions/workflows/go.yml/badge.svg)](https://github.com/0x5844/pqcGO/actions)
+[![GitHub Tag](https://img.shields.io/github/v/tag/0x5844/pqcGO)](https://github.com/0x5844/pqcGO/releases)
+
+
+
 # 🔒 Go-PQC-Stream: Post-Quantum File Encryption Tool
 
 A high-performance command-line tool for secure file encryption using a hybrid post-quantum and classical cryptographic scheme. It is optimized for large files with a parallel streaming pipeline.
