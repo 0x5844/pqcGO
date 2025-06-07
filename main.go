@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
@@ -14,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"crypto/mlkem"
@@ -32,11 +32,22 @@ const (
 	X25519PrivateKeySize   = 32
 	X25519SharedSecretSize = 32
 	Blake2sHashSize        = 32
-	StreamChunkSize        = 64 * 1024
+	HmacInfoSize           = 32
+	StreamChunkSize        = 1 * 1024 * 1024
 	KeyExt                 = ".key"
 	PubKeyExt              = ".pub"
 	EncryptedExt           = ".enc"
 	FileFormatVersion      = 3
+)
+
+var (
+	numWorkers = runtime.NumCPU()
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, StreamChunkSize)
+			return &b
+		},
+	}
 )
 
 type SecurityLevel int
@@ -107,6 +118,17 @@ type StressTestConfig struct {
 	SecurityLevels []SecurityLevel
 }
 
+type chunkJob struct {
+	id   int
+	data []byte
+}
+
+type chunkResult struct {
+	id   int
+	data []byte
+	err  error
+}
+
 func NewQuantumEngine(level SecurityLevel, preferMLKEM bool) *QuantumEngine {
 	engine := &QuantumEngine{
 		securityLevel: level,
@@ -127,13 +149,13 @@ func NewQuantumEngine(level SecurityLevel, preferMLKEM bool) *QuantumEngine {
 	return engine
 }
 
-func deriveKeyBLAKE2s(sharedSecret []byte, info string) ([]byte, error) {
+func deriveKeyBLAKE2s(sharedSecret []byte, info []byte) ([]byte, error) {
 	h, err := blake2s.New256(nil)
 	if err != nil {
 		return nil, err
 	}
 	h.Write(sharedSecret)
-	h.Write([]byte(info))
+	h.Write(info)
 	return h.Sum(nil), nil
 }
 
@@ -489,6 +511,7 @@ func (qe *QuantumEngine) EncryptFile(inputFile, outputFile, publicKeyFile string
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer outFile.Close()
+
 	encData, encryptionKey, err := qe.HybridEncapsulate(publicKeyPair)
 	if err != nil {
 		return err
@@ -498,45 +521,118 @@ func (qe *QuantumEngine) EncryptFile(inputFile, outputFile, publicKeyFile string
 		return fmt.Errorf("failed to generate nonce: %w", err)
 	}
 	encData.Nonce = nonce
-	hmacKey, err := deriveKeyBLAKE2s(encryptionKey, "FILE_INTEGRITY_V3_STREAM")
+
+	hmacInfo := make([]byte, HmacInfoSize)
+	if _, err := io.ReadFull(rand.Reader, hmacInfo); err != nil {
+		return fmt.Errorf("failed to generate HMAC info: %w", err)
+	}
+
+	hmacKey, err := deriveKeyBLAKE2s(encryptionKey, hmacInfo)
 	if err != nil {
 		return fmt.Errorf("failed to derive HMAC key: %w", err)
 	}
-	streamCipher, err := chacha20.NewUnauthenticatedCipher(encryptionKey, nonce)
-	if err != nil {
-		return fmt.Errorf("failed to create stream cipher: %w", err)
-	}
-	mac := hmac.New(func() hash.Hash { h, _ := blake2s.New256(nil); return h }, hmacKey)
+
 	headerBuf := new(bytes.Buffer)
 	if err := qe.saveEncryptedHeader(headerBuf, encData); err != nil {
 		return fmt.Errorf("failed to serialize header: %w", err)
 	}
+
+	mac := hmac.New(func() hash.Hash { h, _ := blake2s.New256(nil); return h }, hmacKey)
 	if _, err := io.MultiWriter(outFile, mac).Write(headerBuf.Bytes()); err != nil {
 		return fmt.Errorf("failed to write header: %w", err)
 	}
-	buf := make([]byte, StreamChunkSize)
+
+	jobs := make(chan chunkJob, numWorkers)
+	results := make(chan chunkResult, numWorkers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			streamCipher, err := chacha20.NewUnauthenticatedCipher(encryptionKey, nonce)
+			if err != nil {
+				results <- chunkResult{err: fmt.Errorf("failed to create stream cipher: %w", err)}
+				return
+			}
+			for job := range jobs {
+				streamCipher.SetCounter(uint32(uint64(job.id) * StreamChunkSize / chacha20.KeySize))
+				ciphertext := make([]byte, len(job.data))
+				streamCipher.XORKeyStream(ciphertext, job.data)
+				bufferPool.Put(&job.data)
+				results <- chunkResult{id: job.id, data: ciphertext}
+			}
+		}()
+	}
+
+	var writeErr error
+	var writeWg sync.WaitGroup
+	writeWg.Add(1)
+	go func() {
+		defer writeWg.Done()
+		resultMap := make(map[int][]byte)
+		nextID := 0
+		for result := range results {
+			if result.err != nil {
+				writeErr = result.err
+				continue
+			}
+			resultMap[result.id] = result.data
+			for {
+				data, ok := resultMap[nextID]
+				if !ok {
+					break
+				}
+				if _, err := io.MultiWriter(outFile, mac).Write(data); err != nil {
+					writeErr = fmt.Errorf("failed to write and mac ciphertext chunk: %w", err)
+					delete(resultMap, nextID)
+					break
+				}
+				delete(resultMap, nextID)
+				nextID++
+			}
+			if writeErr != nil {
+				break
+			}
+		}
+	}()
+
+	chunkID := 0
 	for {
-		n, err := inFile.Read(buf)
+		bufferPtr := bufferPool.Get().(*[]byte)
+		n, err := inFile.Read(*bufferPtr)
 		if n > 0 {
-			encryptedChunk := make([]byte, n)
-			streamCipher.XORKeyStream(encryptedChunk, buf[:n])
-			if _, writeErr := outFile.Write(encryptedChunk); writeErr != nil {
-				return fmt.Errorf("failed to write ciphertext chunk: %w", writeErr)
-			}
-			if _, writeErr := mac.Write(encryptedChunk); writeErr != nil {
-				return fmt.Errorf("failed to write to hmac: %w", writeErr)
-			}
+			jobs <- chunkJob{id: chunkID, data: (*bufferPtr)[:n]}
+			chunkID++
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			close(jobs)
+			wg.Wait()
+			close(results)
+			writeWg.Wait()
 			return fmt.Errorf("failed to read from input file: %w", err)
 		}
 	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+	writeWg.Wait()
+
+	if writeErr != nil {
+		return writeErr
+	}
+
 	if _, err := outFile.Write(mac.Sum(nil)); err != nil {
 		return fmt.Errorf("failed to write HMAC: %w", err)
 	}
+
+	if _, err := outFile.Write(hmacInfo); err != nil {
+		return fmt.Errorf("failed to write HMAC info: %w", err)
+	}
+
 	return nil
 }
 
@@ -545,40 +641,51 @@ func (qe *QuantumEngine) DecryptFile(inputFile, outputFile, privateKeyFile strin
 	if err != nil {
 		return err
 	}
+
 	inFile, err := os.Open(inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to open input file: %w", err)
 	}
 	defer inFile.Close()
+
 	fileInfo, err := inFile.Stat()
 	if err != nil {
 		return err
 	}
 	fileSize := fileInfo.Size()
-	if fileSize < Blake2sHashSize {
+	if fileSize < (Blake2sHashSize + HmacInfoSize) {
 		return fmt.Errorf("input file is too small to be valid")
 	}
+
+	hmacInfo := make([]byte, HmacInfoSize)
+	if _, err := inFile.ReadAt(hmacInfo, fileSize-HmacInfoSize); err != nil {
+		return fmt.Errorf("failed to read HMAC info: %w", err)
+	}
+
+	expectedHMAC := make([]byte, Blake2sHashSize)
+	if _, err := inFile.ReadAt(expectedHMAC, fileSize-Blake2sHashSize-HmacInfoSize); err != nil {
+		return fmt.Errorf("failed to read expected HMAC: %w", err)
+	}
+
+	if _, err := inFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to start of input file: %w", err)
+	}
+
 	encData, headerSize, err := qe.loadEncryptedHeader(inFile)
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted header: %w", err)
 	}
+
 	encryptionKey, err := qe.HybridDecapsulate(privateKeyPair, encData)
 	if err != nil {
 		return err
 	}
-	hmacKey, err := deriveKeyBLAKE2s(encryptionKey, "FILE_INTEGRITY_V3_STREAM")
+
+	hmacKey, err := deriveKeyBLAKE2s(encryptionKey, hmacInfo)
 	if err != nil {
 		return fmt.Errorf("failed to derive HMAC key: %w", err)
 	}
-	if _, err := inFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek in input file: %w", err)
-	}
-	contentReader := io.LimitReader(inFile, fileSize-Blake2sHashSize)
-	mac := hmac.New(func() hash.Hash { h, _ := blake2s.New256(nil); return h }, hmacKey)
-	verifyingReader := io.TeeReader(contentReader, mac)
-	if _, err := io.CopyN(io.Discard, verifyingReader, headerSize); err != nil {
-		return fmt.Errorf("failed to read past header for verification: %w", err)
-	}
+
 	outTmpFile, err := os.Create(outputFile + ".tmp")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary output file: %w", err)
@@ -589,26 +696,115 @@ func (qe *QuantumEngine) DecryptFile(inputFile, outputFile, privateKeyFile strin
 			os.Remove(outputFile + ".tmp")
 		}
 	}()
-	streamCipher, err := chacha20.NewUnauthenticatedCipher(encryptionKey, encData.Nonce)
-	if err != nil {
-		return fmt.Errorf("failed to create stream cipher: %w", err)
+
+	jobs := make(chan chunkJob, numWorkers)
+	results := make(chan chunkResult, numWorkers)
+	var workerWg sync.WaitGroup
+
+	for i := 0; i < numWorkers; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			streamCipher, err := chacha20.NewUnauthenticatedCipher(encryptionKey, encData.Nonce)
+			if err != nil {
+				results <- chunkResult{err: fmt.Errorf("failed to create stream cipher: %w", err)}
+				return
+			}
+			for job := range jobs {
+				streamCipher.SetCounter(uint32(uint64(job.id) * StreamChunkSize / chacha20.KeySize))
+				plaintext := make([]byte, len(job.data))
+				streamCipher.XORKeyStream(plaintext, job.data)
+				bufferPool.Put(&job.data)
+				results <- chunkResult{id: job.id, data: plaintext}
+			}
+		}()
 	}
-	decryptingReader := &cipher.StreamReader{S: streamCipher, R: verifyingReader}
-	if _, err := io.Copy(outTmpFile, decryptingReader); err != nil {
-		return fmt.Errorf("decryption failed during copy: %w", err)
+
+	var writeErr error
+	var writeWg sync.WaitGroup
+	writeWg.Add(1)
+	go func() {
+		defer writeWg.Done()
+		resultMap := make(map[int][]byte)
+		nextID := 0
+		for result := range results {
+			if result.err != nil {
+				writeErr = result.err
+				continue
+			}
+			resultMap[result.id] = result.data
+			for {
+				data, ok := resultMap[nextID]
+				if !ok {
+					break
+				}
+				if _, err := outTmpFile.Write(data); err != nil {
+					writeErr = fmt.Errorf("decryption failed during copy: %w", err)
+				}
+				delete(resultMap, nextID)
+				nextID++
+				if writeErr != nil {
+					break
+				}
+			}
+			if writeErr != nil {
+				break
+			}
+		}
+	}()
+
+	if _, err := inFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to start of file for verification: %w", err)
 	}
-	expectedHMAC := make([]byte, Blake2sHashSize)
-	if _, err := inFile.Read(expectedHMAC); err != nil {
-		return fmt.Errorf("failed to read expected HMAC from file: %w", err)
+
+	mac := hmac.New(func() hash.Hash { h, _ := blake2s.New256(nil); return h }, hmacKey)
+	headerBytes := make([]byte, headerSize)
+	if _, err := io.ReadFull(inFile, headerBytes); err != nil {
+		return fmt.Errorf("failed to read header for verification: %w", err)
 	}
+	mac.Write(headerBytes)
+
+	verifiableContentLength := fileSize - headerSize - Blake2sHashSize - HmacInfoSize
+	verifyingReader := io.TeeReader(io.LimitReader(inFile, verifiableContentLength), mac)
+
+	chunkID := 0
+	for {
+		bufferPtr := bufferPool.Get().(*[]byte)
+		n, readErr := verifyingReader.Read(*bufferPtr)
+		if n > 0 {
+			jobs <- chunkJob{id: chunkID, data: (*bufferPtr)[:n]}
+			chunkID++
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			close(jobs)
+			workerWg.Wait()
+			close(results)
+			writeWg.Wait()
+			return fmt.Errorf("failed to read from input file for decryption: %w", readErr)
+		}
+	}
+	close(jobs)
+	workerWg.Wait()
+	close(results)
+	writeWg.Wait()
+
+	if writeErr != nil {
+		return writeErr
+	}
+
 	computedHMAC := mac.Sum(nil)
 	if !hmac.Equal(computedHMAC, expectedHMAC) {
 		return fmt.Errorf("file integrity verification failed: HMAC mismatch")
 	}
+
 	outTmpFile.Close()
 	if err := os.Rename(outputFile+".tmp", outputFile); err != nil {
 		return fmt.Errorf("failed to rename temporary file: %w", err)
 	}
+
 	return nil
 }
 
@@ -769,8 +965,8 @@ func main() {
 		help          = flag.Bool("help", false, "Show help message")
 	)
 	flag.Parse()
-	if *help {
-		fmt.Println("Post-Quantum Secure Stream Encryption Engine (v3)")
+	if *help || (len(os.Args) == 1) {
+		fmt.Println("Post-Quantum Secure Stream Encryption Engine (v3.2-optimized)")
 		flag.PrintDefaults()
 		return
 	}
@@ -794,8 +990,8 @@ func main() {
 	switch {
 	case *benchmark:
 		config := StressTestConfig{
-			FileSizes:      []int64{10 * 1024, 1024 * 1024, 100 * 1024 * 1024, 1 * 1024 * 1024 * 1024}, // 10KB, 1MB, 100MB, 1GB
-			Concurrency:    runtime.NumCPU(),
+			FileSizes:      []int64{10 * 1024, 1024 * 1024, 100 * 1024 * 1024, 1 * 1024 * 1024 * 1024},
+			Concurrency:    numWorkers,
 			CleanupFiles:   true,
 			SecurityLevels: []SecurityLevel{Level192, Level256},
 		}
@@ -816,7 +1012,7 @@ func main() {
 		if outputFile == "" {
 			outputFile = *encrypt + EncryptedExt
 		}
-		fmt.Printf("Encrypting %s -> %s ...\n", *encrypt, outputFile)
+		fmt.Printf("Encrypting %s -> %s using %d worker(s)...\n", *encrypt, outputFile, numWorkers)
 		if err := engine.EncryptFile(*encrypt, outputFile, *publicKey); err != nil {
 			log.Fatalf("Encryption failed: %v", err)
 		}
@@ -834,7 +1030,7 @@ func main() {
 				outputFile = *decrypt + ".decrypted"
 			}
 		}
-		fmt.Printf("Decrypting %s -> %s ...\n", *decrypt, outputFile)
+		fmt.Printf("Decrypting %s -> %s using %d worker(s)...\n", *decrypt, outputFile, numWorkers)
 		if err := engine.DecryptFile(*decrypt, outputFile, *privateKey); err != nil {
 			log.Fatalf("Decryption failed: %v", err)
 		}
