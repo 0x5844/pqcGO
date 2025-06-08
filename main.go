@@ -37,6 +37,7 @@ const (
 	FileFormatVersion     = 5
 	DerivationContextSize = 32
 	AEADOverhead          = 16
+	KyberQ                = 3329
 )
 
 var (
@@ -62,6 +63,28 @@ func (sl SecurityLevel) String() string {
 		return "256-bit"
 	default:
 		return "unknown"
+	}
+}
+
+func montgomeryReduce(a uint32) uint32 {
+	const qinv = 0x2f0bb5ff
+	t := a * qinv
+	t = (t + (a << 16)) >> 16
+	return uint32(a - t*KyberQ)
+}
+
+func constantTimeNtt(poly []uint16) {
+	k := 1
+	for length := 128; length >= 2; length >>= 1 {
+		for start := 0; start < 256; start = start + 2*length {
+			zeta := montgomeryReduce(uint32(poly[k]))
+			k++
+			for j := start; j < start+length; j++ {
+				t := montgomeryReduce(uint32(zeta) * uint32(poly[j+length]))
+				poly[j+length] = uint16(uint32(poly[j]) + 4*KyberQ - t)
+				poly[j] = uint16(uint32(poly[j]) + t)
+			}
+		}
 	}
 }
 
@@ -203,6 +226,49 @@ func createChunkNonce(baseNonce []byte, chunkID int) []byte {
 	copy(nonce, baseNonce)
 	binary.BigEndian.PutUint64(nonce[16:], uint64(chunkID))
 	return nonce
+}
+
+func isValidMLKEMCiphertext(ct []byte, level SecurityLevel) bool {
+	var expectedLength int
+	switch level {
+	case Level192:
+		expectedLength = 1088
+	case Level256:
+		expectedLength = 1568
+	default:
+		return false
+	}
+	if len(ct) != expectedLength {
+		return false
+	}
+	if len(ct) < 32 {
+		return false
+	}
+	for i := 0; i < 16; i++ {
+		if ct[i] == 0 && ct[i+1] == 0 {
+			continue
+		}
+		break
+	}
+	return true
+}
+
+func isValidKyberCiphertext(ct []byte, level SecurityLevel) bool {
+	var expectedLength int
+	switch level {
+	case Level128:
+		expectedLength = 768
+	case Level192:
+		expectedLength = 1088
+	case Level256:
+		expectedLength = 1568
+	default:
+		return false
+	}
+	if len(ct) != expectedLength {
+		return false
+	}
+	return true
 }
 
 func (qe *QuantumEngine) encryptChunkAEAD(data, key, baseNonce []byte, chunkID int) ([]byte, error) {
@@ -449,6 +515,9 @@ func (qe *QuantumEngine) HybridDecapsulate(privateKeyPair *HybridKeyPair, header
 	var mlkemSecret, x25519Secret, kyberSecret []byte
 	var err error
 	if header.UseMLKEM && len(header.MLKEMCiphertext) > 0 {
+		if !isValidMLKEMCiphertext(header.MLKEMCiphertext, SecurityLevel(header.SecurityLevel)) {
+			return nil, fmt.Errorf("invalid ML-KEM ciphertext format")
+		}
 		switch SecurityLevel(header.SecurityLevel) {
 		case Level192:
 			dk, err := mlkem.NewDecapsulationKey768(privateKeyPair.MLKEMPrivateKey)
@@ -473,6 +542,9 @@ func (qe *QuantumEngine) HybridDecapsulate(privateKeyPair *HybridKeyPair, header
 	x25519Secret, err = curve25519.X25519(privateKeyPair.X25519PrivateKey[:], header.X25519PublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to perform X25519 key exchange: %w", err)
+	}
+	if !isValidKyberCiphertext(header.KyberCiphertext, privateKeyPair.SecurityLevel) {
+		return nil, fmt.Errorf("invalid Kyber ciphertext format")
 	}
 	kyberParams := getKyberParams(privateKeyPair.SecurityLevel)
 	kyberSecret = kyberParams.Decaps(privateKeyPair.KyberPrivateKey, header.KyberCiphertext)
@@ -943,7 +1015,7 @@ func main() {
 	)
 	flag.Parse()
 	if *help || (len(os.Args) == 1 && !*benchmark) {
-		fmt.Println("Post-Quantum Secure Stream Encryption Engine (v4.0-AEAD)")
+		fmt.Println("Post-Quantum Secure Stream Encryption Engine (v5.0-AEAD)")
 		flag.PrintDefaults()
 		return
 	}
