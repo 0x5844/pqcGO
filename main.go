@@ -38,6 +38,7 @@ const (
 	PubKeyExt              = ".pub"
 	EncryptedExt           = ".enc"
 	FileFormatVersion      = 3
+	DerivationContextSize  = 32
 )
 
 var (
@@ -101,13 +102,14 @@ type QuantumEngine struct {
 }
 
 type EncryptedHeader struct {
-	Version         uint32
-	SecurityLevel   uint32
-	UseMLKEM        bool
-	MLKEMCiphertext []byte
-	X25519PublicKey []byte
-	KyberCiphertext []byte
-	Nonce           []byte
+	Version           uint32
+	SecurityLevel     uint32
+	UseMLKEM          bool
+	MLKEMCiphertext   []byte
+	X25519PublicKey   []byte
+	KyberCiphertext   []byte
+	Nonce             []byte
+	DerivationContext []byte
 }
 
 type BenchmarkResult struct {
@@ -141,6 +143,19 @@ type chunkResult struct {
 	err  error
 }
 
+func generateSecureRandomString(length int) ([]byte, error) {
+	if length <= 0 {
+		return nil, fmt.Errorf("invalid length: %d", length)
+	}
+
+	randomBytes := make([]byte, length)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate secure random bytes: %w", err)
+	}
+
+	return randomBytes, nil
+}
+
 func NewQuantumEngine(level SecurityLevel, preferMLKEM bool) *QuantumEngine {
 	return &QuantumEngine{
 		securityLevel: level,
@@ -158,11 +173,11 @@ func deriveKeyBLAKE2s(sharedSecret []byte, info []byte) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
-func deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret []byte, info string) ([]byte, error) {
+func deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret []byte, derivationContext []byte) ([]byte, error) {
 	h := hkdf.New(func() hash.Hash {
 		h, _ := blake2s.New256(nil)
 		return h
-	}, append(append(mlkemSecret, x25519Secret...), kyberSecret...), nil, []byte(info))
+	}, append(append(mlkemSecret, x25519Secret...), kyberSecret...), nil, derivationContext)
 	key := make([]byte, ChaChaKeySize)
 	if _, err := io.ReadFull(h, key); err != nil {
 		return nil, err
@@ -345,8 +360,13 @@ func (qe *QuantumEngine) HybridEncapsulate(publicKeyPair *HybridKeyPair) (*Encry
 		UseMLKEM:      publicKeyPair.UseMLKEM,
 	}
 
+	derivationContext, err := generateSecureRandomString(DerivationContextSize)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate derivation context: %w", err)
+	}
+	header.DerivationContext = derivationContext
+
 	var mlkemSecret, x25519Secret, kyberSecret []byte
-	var err error
 
 	if publicKeyPair.UseMLKEM && len(publicKeyPair.MLKEMPublicKey) > 0 {
 		switch publicKeyPair.SecurityLevel {
@@ -387,7 +407,7 @@ func (qe *QuantumEngine) HybridEncapsulate(publicKeyPair *HybridKeyPair) (*Encry
 	}
 	kyberSecret, header.KyberCiphertext = kyberSharedSecret, kyberCiphertext
 
-	encryptionKey, err := deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret, "HYBRID_ENCRYPTION_V3")
+	encryptionKey, err := deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret, derivationContext)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to derive hybrid encryption key: %w", err)
 	}
@@ -433,7 +453,7 @@ func (qe *QuantumEngine) HybridDecapsulate(privateKeyPair *HybridKeyPair, header
 		return nil, fmt.Errorf("failed to decapsulate Kyber shared secret")
 	}
 
-	return deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret, "HYBRID_ENCRYPTION_V3")
+	return deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret, header.DerivationContext)
 }
 
 func (qe *QuantumEngine) saveEncryptedHeader(w io.Writer, header *EncryptedHeader) error {
@@ -449,7 +469,11 @@ func (qe *QuantumEngine) saveEncryptedHeader(w io.Writer, header *EncryptedHeade
 	if err := writeBytesWithLength(w, header.KyberCiphertext); err != nil {
 		return err
 	}
-	return writeBytesWithLength(w, header.Nonce)
+	if err := writeBytesWithLength(w, header.Nonce); err != nil {
+		return err
+	}
+	// Save the derivation context
+	return writeBytesWithLength(w, header.DerivationContext)
 }
 
 func (qe *QuantumEngine) loadEncryptedHeader(r io.Reader) (*EncryptedHeader, int64, error) {
@@ -471,6 +495,9 @@ func (qe *QuantumEngine) loadEncryptedHeader(r io.Reader) (*EncryptedHeader, int
 		return nil, 0, err
 	}
 	if header.Nonce, err = readBytesWithLength(startCounter); err != nil {
+		return nil, 0, err
+	}
+	if header.DerivationContext, err = readBytesWithLength(startCounter); err != nil {
 		return nil, 0, err
 	}
 	return header, startCounter.bytes, nil
