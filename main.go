@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto/mlkem"
@@ -33,13 +34,14 @@ const (
 	KeyExt                = ".key"
 	PubKeyExt             = ".pub"
 	EncryptedExt          = ".enc"
-	FileFormatVersion     = 4
+	FileFormatVersion     = 5
 	DerivationContextSize = 32
 	AEADOverhead          = 16
 )
 
 var (
-	numWorkers = runtime.NumCPU()
+	numWorkers   = runtime.NumCPU()
+	nonceCounter uint64
 )
 
 type SecurityLevel int
@@ -85,6 +87,18 @@ type HybridKeyPair struct {
 	KyberPrivateKey  []byte
 	SecurityLevel    SecurityLevel
 	UseMLKEM         bool
+}
+
+func (k *HybridKeyPair) Zeroize() {
+	for i := range k.X25519PrivateKey {
+		k.X25519PrivateKey[i] = 0
+	}
+	for i := range k.MLKEMPrivateKey {
+		k.MLKEMPrivateKey[i] = 0
+	}
+	for i := range k.KyberPrivateKey {
+		k.KyberPrivateKey[i] = 0
+	}
 }
 
 type QuantumEngine struct {
@@ -157,16 +171,28 @@ func NewQuantumEngine(level SecurityLevel, preferMLKEM bool, compressionLevel in
 	}
 }
 
-func deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret []byte, derivationContext []byte) ([]byte, error) {
+func deriveHybridKeySecure(mlkemSecret, x25519Secret, kyberSecret []byte, mlkemCt, x25519Ct, kyberCt []byte, derivationContext []byte) ([]byte, error) {
+	combinedSecrets := append(append(mlkemSecret, x25519Secret...), kyberSecret...)
+	combinedCt := append(append(mlkemCt, x25519Ct...), kyberCt...)
+	info := append(combinedCt, derivationContext...)
+
 	h := hkdf.New(func() hash.Hash {
 		h, _ := blake2s.New256(nil)
 		return h
-	}, append(append(mlkemSecret, x25519Secret...), kyberSecret...), nil, derivationContext)
+	}, combinedSecrets, nil, info)
+
 	key := make([]byte, AEADKeySize)
 	if _, err := io.ReadFull(h, key); err != nil {
 		return nil, err
 	}
 	return key, nil
+}
+
+func atomicNonce() []byte {
+	count := atomic.AddUint64(&nonceCounter, 1)
+	nonce := make([]byte, XChaCha20NonceSize)
+	binary.BigEndian.PutUint64(nonce[16:], count)
+	return nonce
 }
 
 func createChunkNonce(baseNonce []byte, chunkID int) []byte {
@@ -274,6 +300,7 @@ func readBytesWithLength(r io.Reader) ([]byte, error) {
 }
 
 func (qe *QuantumEngine) SaveHybridKeys(keyPair *HybridKeyPair, baseName string) error {
+	defer keyPair.Zeroize()
 	privateKeyFile := baseName + KeyExt
 	privFile, err := os.OpenFile(privateKeyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
@@ -411,7 +438,7 @@ func (qe *QuantumEngine) HybridEncapsulate(publicKeyPair *HybridKeyPair) (*Encry
 		return nil, nil, fmt.Errorf("failed to encapsulate Kyber shared secret")
 	}
 	kyberSecret, header.KyberCiphertext = kyberSharedSecret, kyberCiphertext
-	encryptionKey, err := deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret, derivationContext)
+	encryptionKey, err := deriveHybridKeySecure(mlkemSecret, x25519Secret, kyberSecret, header.MLKEMCiphertext, header.X25519PublicKey, header.KyberCiphertext, derivationContext)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to derive hybrid encryption key: %w", err)
 	}
@@ -452,7 +479,7 @@ func (qe *QuantumEngine) HybridDecapsulate(privateKeyPair *HybridKeyPair, header
 	if kyberSecret == nil {
 		return nil, fmt.Errorf("failed to decapsulate Kyber shared secret")
 	}
-	return deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret, header.DerivationContext)
+	return deriveHybridKeySecure(mlkemSecret, x25519Secret, kyberSecret, header.MLKEMCiphertext, header.X25519PublicKey, header.KyberCiphertext, header.DerivationContext)
 }
 
 func (qe *QuantumEngine) saveEncryptedHeader(w io.Writer, header *EncryptedHeader) error {
@@ -614,10 +641,7 @@ func (qe *QuantumEngine) EncryptFile(inputFile, outputFile, publicKeyFile string
 	if err != nil {
 		return err
 	}
-	nonce := make([]byte, XChaCha20NonceSize)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return fmt.Errorf("failed to generate nonce: %w", err)
-	}
+	nonce := atomicNonce()
 	header.Nonce = nonce
 	headerBuf := new(bytes.Buffer)
 	if err := qe.saveEncryptedHeader(headerBuf, header); err != nil {
@@ -697,6 +721,7 @@ func (qe *QuantumEngine) DecryptFile(inputFile, outputFile, privateKeyFile strin
 	if err != nil {
 		return err
 	}
+	defer privateKeyPair.Zeroize()
 	inFile, err := os.Open(inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to open input file: %w", err)
