@@ -66,27 +66,27 @@ func (sl SecurityLevel) String() string {
 	}
 }
 
-func montgomeryReduce(a uint32) uint32 {
-	const qinv = 0x2f0bb5ff
-	t := a * qinv
-	t = (t + (a << 16)) >> 16
-	return uint32(a - t*KyberQ)
-}
+// func montgomeryReduce(a uint32) uint32 {
+// 	const qinv = 0x2f0bb5ff
+// 	t := a * qinv
+// 	t = (t + (a << 16)) >> 16
+// 	return uint32(a - t*KyberQ)
+// }
 
-func constantTimeNtt(poly []uint16) {
-	k := 1
-	for length := 128; length >= 2; length >>= 1 {
-		for start := 0; start < 256; start = start + 2*length {
-			zeta := montgomeryReduce(uint32(poly[k]))
-			k++
-			for j := start; j < start+length; j++ {
-				t := montgomeryReduce(uint32(zeta) * uint32(poly[j+length]))
-				poly[j+length] = uint16(uint32(poly[j]) + 4*KyberQ - t)
-				poly[j] = uint16(uint32(poly[j]) + t)
-			}
-		}
-	}
-}
+// func constantTimeNtt(poly []uint16) {
+// 	k := 1
+// 	for length := 128; length >= 2; length >>= 1 {
+// 		for start := 0; start < 256; start = start + 2*length {
+// 			zeta := montgomeryReduce(uint32(poly[k]))
+// 			k++
+// 			for j := start; j < start+length; j++ {
+// 				t := montgomeryReduce(uint32(zeta) * uint32(poly[j+length]))
+// 				poly[j+length] = uint16(uint32(poly[j]) + 4*KyberQ - t)
+// 				poly[j] = uint16(uint32(poly[j]) + t)
+// 			}
+// 		}
+// 	}
+// }
 
 func getKyberParams(level SecurityLevel) *kyber.Kyber {
 	switch level {
