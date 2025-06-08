@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
 	"flag"
@@ -20,35 +19,26 @@ import (
 
 	kyber "github.com/kudelskisecurity/crystals-go/crystals-kyber"
 	"golang.org/x/crypto/blake2s"
-	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
 
 const (
-	ChaChaKeySize          = 32
-	ChaChaNonceSize        = 24
-	ChaChaBlockSize        = 64
-	X25519KeySize          = 32
-	X25519SharedSecretSize = 32
-	Blake2sHashSize        = 32
-	HmacInfoSize           = 32
-	StreamChunkSize        = 1 * 1024 * 1024
-	KeyExt                 = ".key"
-	PubKeyExt              = ".pub"
-	EncryptedExt           = ".enc"
-	FileFormatVersion      = 3
-	DerivationContextSize  = 32
+	AEADKeySize           = 32
+	XChaCha20NonceSize    = 24
+	X25519KeySize         = 32
+	StreamChunkSize       = 1 * 1024 * 1024
+	KeyExt                = ".key"
+	PubKeyExt             = ".pub"
+	EncryptedExt          = ".enc"
+	FileFormatVersion     = 4
+	DerivationContextSize = 32
+	AEADOverhead          = 16
 )
 
 var (
 	numWorkers = runtime.NumCPU()
-	bufferPool = sync.Pool{
-		New: func() interface{} {
-			b := make([]byte, StreamChunkSize)
-			return &b
-		},
-	}
 )
 
 type SecurityLevel int
@@ -133,8 +123,9 @@ type StressTestConfig struct {
 }
 
 type chunkJob struct {
-	id   int
-	data []byte
+	id      int
+	data    []byte
+	encrypt bool
 }
 
 type chunkResult struct {
@@ -147,12 +138,10 @@ func generateSecureRandomString(length int) ([]byte, error) {
 	if length <= 0 {
 		return nil, fmt.Errorf("invalid length: %d", length)
 	}
-
 	randomBytes := make([]byte, length)
 	if _, err := rand.Read(randomBytes); err != nil {
 		return nil, fmt.Errorf("failed to generate secure random bytes: %w", err)
 	}
-
 	return randomBytes, nil
 }
 
@@ -163,26 +152,52 @@ func NewQuantumEngine(level SecurityLevel, preferMLKEM bool) *QuantumEngine {
 	}
 }
 
-func deriveKeyBLAKE2s(sharedSecret []byte, info []byte) ([]byte, error) {
-	h, err := blake2s.New256(nil)
-	if err != nil {
-		return nil, err
-	}
-	h.Write(sharedSecret)
-	h.Write(info)
-	return h.Sum(nil), nil
-}
-
 func deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret []byte, derivationContext []byte) ([]byte, error) {
 	h := hkdf.New(func() hash.Hash {
 		h, _ := blake2s.New256(nil)
 		return h
 	}, append(append(mlkemSecret, x25519Secret...), kyberSecret...), nil, derivationContext)
-	key := make([]byte, ChaChaKeySize)
+	key := make([]byte, AEADKeySize)
 	if _, err := io.ReadFull(h, key); err != nil {
 		return nil, err
 	}
 	return key, nil
+}
+
+func createChunkNonce(baseNonce []byte, chunkID int) []byte {
+	if len(baseNonce) != XChaCha20NonceSize {
+		panic("invalid base nonce size")
+	}
+	nonce := make([]byte, XChaCha20NonceSize)
+	copy(nonce, baseNonce)
+	binary.BigEndian.PutUint64(nonce[16:], uint64(chunkID))
+	return nonce
+}
+
+func (qe *QuantumEngine) encryptChunkAEAD(data, key, baseNonce []byte, chunkID int) ([]byte, error) {
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create XChaCha20-Poly1305 cipher: %w", err)
+	}
+	chunkNonce := createChunkNonce(baseNonce, chunkID)
+	aad := make([]byte, 8)
+	binary.BigEndian.PutUint64(aad, uint64(chunkID))
+	return aead.Seal(nil, chunkNonce, data, aad), nil
+}
+
+func (qe *QuantumEngine) decryptChunkAEAD(ciphertext, key, baseNonce []byte, chunkID int) ([]byte, error) {
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create XChaCha20-Poly1305 cipher: %w", err)
+	}
+	chunkNonce := createChunkNonce(baseNonce, chunkID)
+	aad := make([]byte, 8)
+	binary.BigEndian.PutUint64(aad, uint64(chunkID))
+	plaintext, err := aead.Open(nil, chunkNonce, ciphertext, aad)
+	if err != nil {
+		return nil, fmt.Errorf("chunk %d authentication failed: %w", chunkID, err)
+	}
+	return plaintext, nil
 }
 
 func (qe *QuantumEngine) GenerateHybridKeyPair() (*HybridKeyPair, error) {
@@ -190,7 +205,6 @@ func (qe *QuantumEngine) GenerateHybridKeyPair() (*HybridKeyPair, error) {
 		SecurityLevel: qe.securityLevel,
 		UseMLKEM:      qe.useMLKEM,
 	}
-
 	x25519Private := make([]byte, X25519KeySize)
 	if _, err := rand.Read(x25519Private); err != nil {
 		return nil, fmt.Errorf("failed to generate X25519 private key: %w", err)
@@ -201,7 +215,6 @@ func (qe *QuantumEngine) GenerateHybridKeyPair() (*HybridKeyPair, error) {
 	}
 	copy(keyPair.X25519PrivateKey[:], x25519Private)
 	copy(keyPair.X25519PublicKey[:], x25519Public)
-
 	if qe.useMLKEM {
 		switch qe.securityLevel {
 		case Level192:
@@ -222,7 +235,6 @@ func (qe *QuantumEngine) GenerateHybridKeyPair() (*HybridKeyPair, error) {
 			return nil, fmt.Errorf("ML-KEM-512 not supported")
 		}
 	}
-
 	kyberParams := getKyberParams(qe.securityLevel)
 	kyberPublic, kyberPrivate := kyberParams.KeyGen(nil)
 	if kyberPublic == nil || kyberPrivate == nil {
@@ -263,28 +275,24 @@ func (qe *QuantumEngine) SaveHybridKeys(keyPair *HybridKeyPair, baseName string)
 		return fmt.Errorf("failed to create private key file: %w", err)
 	}
 	defer privFile.Close()
-
 	binary.Write(privFile, binary.BigEndian, uint32(FileFormatVersion))
 	binary.Write(privFile, binary.BigEndian, uint32(keyPair.SecurityLevel))
 	binary.Write(privFile, binary.BigEndian, keyPair.UseMLKEM)
 	privFile.Write(keyPair.X25519PrivateKey[:])
 	writeBytesWithLength(privFile, keyPair.MLKEMPrivateKey)
 	writeBytesWithLength(privFile, keyPair.KyberPrivateKey)
-
 	publicKeyFile := baseName + PubKeyExt
 	pubFile, err := os.Create(publicKeyFile)
 	if err != nil {
 		return fmt.Errorf("failed to create public key file: %w", err)
 	}
 	defer pubFile.Close()
-
 	binary.Write(pubFile, binary.BigEndian, uint32(FileFormatVersion))
 	binary.Write(pubFile, binary.BigEndian, uint32(keyPair.SecurityLevel))
 	binary.Write(pubFile, binary.BigEndian, keyPair.UseMLKEM)
 	pubFile.Write(keyPair.X25519PublicKey[:])
 	writeBytesWithLength(pubFile, keyPair.MLKEMPublicKey)
 	writeBytesWithLength(pubFile, keyPair.KyberPublicKey)
-
 	fmt.Printf("Hybrid keys saved:\n")
 	fmt.Printf("  Private: %s\n", privateKeyFile)
 	fmt.Printf("  Public: %s\n", publicKeyFile)
@@ -302,7 +310,6 @@ func (qe *QuantumEngine) LoadHybridPublicKey(filename string) (*HybridKeyPair, e
 		return nil, fmt.Errorf("failed to open public key file: %w", err)
 	}
 	defer file.Close()
-
 	keyPair := &HybridKeyPair{}
 	var version, secLevel uint32
 	var useMLKEM bool
@@ -311,7 +318,6 @@ func (qe *QuantumEngine) LoadHybridPublicKey(filename string) (*HybridKeyPair, e
 	binary.Read(file, binary.BigEndian, &useMLKEM)
 	keyPair.SecurityLevel = SecurityLevel(secLevel)
 	keyPair.UseMLKEM = useMLKEM
-
 	io.ReadFull(file, keyPair.X25519PublicKey[:])
 	keyPair.MLKEMPublicKey, err = readBytesWithLength(file)
 	if err != nil {
@@ -330,7 +336,6 @@ func (qe *QuantumEngine) LoadHybridPrivateKey(filename string) (*HybridKeyPair, 
 		return nil, fmt.Errorf("failed to open private key file: %w", err)
 	}
 	defer file.Close()
-
 	keyPair := &HybridKeyPair{}
 	var version, secLevel uint32
 	var useMLKEM bool
@@ -339,7 +344,6 @@ func (qe *QuantumEngine) LoadHybridPrivateKey(filename string) (*HybridKeyPair, 
 	binary.Read(file, binary.BigEndian, &useMLKEM)
 	keyPair.SecurityLevel = SecurityLevel(secLevel)
 	keyPair.UseMLKEM = useMLKEM
-
 	io.ReadFull(file, keyPair.X25519PrivateKey[:])
 	var keyErr error
 	keyPair.MLKEMPrivateKey, keyErr = readBytesWithLength(file)
@@ -359,15 +363,12 @@ func (qe *QuantumEngine) HybridEncapsulate(publicKeyPair *HybridKeyPair) (*Encry
 		SecurityLevel: uint32(publicKeyPair.SecurityLevel),
 		UseMLKEM:      publicKeyPair.UseMLKEM,
 	}
-
 	derivationContext, err := generateSecureRandomString(DerivationContextSize)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to generate derivation context: %w", err)
 	}
 	header.DerivationContext = derivationContext
-
 	var mlkemSecret, x25519Secret, kyberSecret []byte
-
 	if publicKeyPair.UseMLKEM && len(publicKeyPair.MLKEMPublicKey) > 0 {
 		switch publicKeyPair.SecurityLevel {
 		case Level192:
@@ -386,7 +387,6 @@ func (qe *QuantumEngine) HybridEncapsulate(publicKeyPair *HybridKeyPair) (*Encry
 			mlkemSecret, header.MLKEMCiphertext = secret, ciphertext
 		}
 	}
-
 	x25519EphemeralPrivate := make([]byte, X25519KeySize)
 	if _, err := rand.Read(x25519EphemeralPrivate); err != nil {
 		return nil, nil, fmt.Errorf("failed to generate X25519 ephemeral key: %w", err)
@@ -399,26 +399,22 @@ func (qe *QuantumEngine) HybridEncapsulate(publicKeyPair *HybridKeyPair) (*Encry
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to perform X25519 key exchange: %w", err)
 	}
-
 	kyberParams := getKyberParams(publicKeyPair.SecurityLevel)
 	kyberCiphertext, kyberSharedSecret := kyberParams.Encaps(publicKeyPair.KyberPublicKey, nil)
 	if kyberCiphertext == nil || kyberSharedSecret == nil {
 		return nil, nil, fmt.Errorf("failed to encapsulate Kyber shared secret")
 	}
 	kyberSecret, header.KyberCiphertext = kyberSharedSecret, kyberCiphertext
-
 	encryptionKey, err := deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret, derivationContext)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to derive hybrid encryption key: %w", err)
 	}
-
 	return header, encryptionKey, nil
 }
 
 func (qe *QuantumEngine) HybridDecapsulate(privateKeyPair *HybridKeyPair, header *EncryptedHeader) ([]byte, error) {
 	var mlkemSecret, x25519Secret, kyberSecret []byte
 	var err error
-
 	if header.UseMLKEM && len(header.MLKEMCiphertext) > 0 {
 		switch SecurityLevel(header.SecurityLevel) {
 		case Level192:
@@ -441,18 +437,15 @@ func (qe *QuantumEngine) HybridDecapsulate(privateKeyPair *HybridKeyPair, header
 			}
 		}
 	}
-
 	x25519Secret, err = curve25519.X25519(privateKeyPair.X25519PrivateKey[:], header.X25519PublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to perform X25519 key exchange: %w", err)
 	}
-
 	kyberParams := getKyberParams(privateKeyPair.SecurityLevel)
 	kyberSecret = kyberParams.Decaps(privateKeyPair.KyberPrivateKey, header.KyberCiphertext)
 	if kyberSecret == nil {
 		return nil, fmt.Errorf("failed to decapsulate Kyber shared secret")
 	}
-
 	return deriveHybridKey(mlkemSecret, x25519Secret, kyberSecret, header.DerivationContext)
 }
 
@@ -472,7 +465,6 @@ func (qe *QuantumEngine) saveEncryptedHeader(w io.Writer, header *EncryptedHeade
 	if err := writeBytesWithLength(w, header.Nonce); err != nil {
 		return err
 	}
-	// Save the derivation context
 	return writeBytesWithLength(w, header.DerivationContext)
 }
 
@@ -480,11 +472,9 @@ func (qe *QuantumEngine) loadEncryptedHeader(r io.Reader) (*EncryptedHeader, int
 	header := &EncryptedHeader{}
 	startCounter := &byteCounter{r: r}
 	var err error
-
 	binary.Read(startCounter, binary.BigEndian, &header.Version)
 	binary.Read(startCounter, binary.BigEndian, &header.SecurityLevel)
 	binary.Read(startCounter, binary.BigEndian, &header.UseMLKEM)
-
 	if header.MLKEMCiphertext, err = readBytesWithLength(startCounter); err != nil {
 		return nil, 0, err
 	}
@@ -514,29 +504,24 @@ func (bc *byteCounter) Read(p []byte) (n int, err error) {
 	return
 }
 
-func (qe *QuantumEngine) processStream(r io.Reader, w io.Writer, key, nonce []byte) error {
-	jobs := make(chan chunkJob, numWorkers)
-	results := make(chan chunkResult, numWorkers)
+func (qe *QuantumEngine) processStream(r io.Reader, w io.Writer, key, nonce []byte, encrypt bool) error {
+	jobs := make(chan chunkJob, numWorkers*2)
+	results := make(chan chunkResult, numWorkers*2)
 	var wg sync.WaitGroup
-	var processorErr error
-	var once sync.Once
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			streamCipher, err := chacha20.NewUnauthenticatedCipher(key, nonce)
-			if err != nil {
-				once.Do(func() { processorErr = err })
-				return
-			}
 			for job := range jobs {
-				blockOffset := uint64(job.id) * uint64(StreamChunkSize) / ChaChaBlockSize
-				streamCipher.SetCounter(uint32(blockOffset))
-				processedData := make([]byte, len(job.data))
-				streamCipher.XORKeyStream(processedData, job.data)
-				bufferPool.Put(&job.data)
-				results <- chunkResult{id: job.id, data: processedData}
+				var processedData []byte
+				var err error
+				if job.encrypt {
+					processedData, err = qe.encryptChunkAEAD(job.data, key, nonce, job.id)
+				} else {
+					processedData, err = qe.decryptChunkAEAD(job.data, key, nonce, job.id)
+				}
+				results <- chunkResult{id: job.id, data: processedData, err: err}
 			}
 		}()
 	}
@@ -551,7 +536,7 @@ func (qe *QuantumEngine) processStream(r io.Reader, w io.Writer, key, nonce []by
 		for result := range results {
 			if result.err != nil {
 				writeErr = result.err
-				break
+				return
 			}
 			resultMap[result.id] = result.data
 			for {
@@ -561,35 +546,42 @@ func (qe *QuantumEngine) processStream(r io.Reader, w io.Writer, key, nonce []by
 				}
 				if _, err := w.Write(data); err != nil {
 					writeErr = fmt.Errorf("failed to write processed chunk %d: %w", nextID, err)
-					delete(resultMap, nextID)
-					break
+					return
 				}
 				delete(resultMap, nextID)
 				nextID++
-			}
-			if writeErr != nil {
-				break
 			}
 		}
 	}()
 
 	chunkID := 0
+	readSize := StreamChunkSize
+	if !encrypt {
+		readSize += AEADOverhead
+	}
 	for {
-		bufferPtr := bufferPool.Get().(*[]byte)
-		n, err := r.Read(*bufferPtr)
+		buffer := make([]byte, readSize)
+		n, err := io.ReadFull(r, buffer)
 		if n > 0 {
-			jobs <- chunkJob{id: chunkID, data: (*bufferPtr)[:n]}
-			chunkID++
+			jobData := make([]byte, n)
+			copy(jobData, buffer[:n])
+			select {
+			case jobs <- chunkJob{id: chunkID, data: jobData, encrypt: encrypt}:
+				chunkID++
+			case <-time.After(time.Second):
+				writeErr = fmt.Errorf("timeout sending chunk job")
+				break
+			}
 		}
-		if err == io.EOF {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		}
 		if err != nil {
-			close(jobs)
-			wg.Wait()
-			close(results)
-			writeWg.Wait()
-			return fmt.Errorf("failed to read from input stream: %w", err)
+			writeErr = fmt.Errorf("failed to read from input stream: %w", err)
+			break
+		}
+		if writeErr != nil {
+			break
 		}
 	}
 
@@ -597,10 +589,6 @@ func (qe *QuantumEngine) processStream(r io.Reader, w io.Writer, key, nonce []by
 	wg.Wait()
 	close(results)
 	writeWg.Wait()
-
-	if processorErr != nil {
-		return fmt.Errorf("worker initialization failed: %w", processorErr)
-	}
 	return writeErr
 }
 
@@ -619,50 +607,23 @@ func (qe *QuantumEngine) EncryptFile(inputFile, outputFile, publicKeyFile string
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer outFile.Close()
-
 	header, encryptionKey, err := qe.HybridEncapsulate(publicKeyPair)
 	if err != nil {
 		return err
 	}
-	nonce := make([]byte, ChaChaNonceSize)
+	nonce := make([]byte, XChaCha20NonceSize)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return fmt.Errorf("failed to generate nonce: %w", err)
 	}
 	header.Nonce = nonce
-
-	hmacInfo := make([]byte, HmacInfoSize)
-	if _, err := io.ReadFull(rand.Reader, hmacInfo); err != nil {
-		return fmt.Errorf("failed to generate HMAC info: %w", err)
-	}
-	hmacKey, err := deriveKeyBLAKE2s(encryptionKey, hmacInfo)
-	if err != nil {
-		return fmt.Errorf("failed to derive HMAC key: %w", err)
-	}
-
 	headerBuf := new(bytes.Buffer)
 	if err := qe.saveEncryptedHeader(headerBuf, header); err != nil {
 		return fmt.Errorf("failed to serialize header: %w", err)
 	}
-
-	mac := hmac.New(func() hash.Hash { h, _ := blake2s.New256(nil); return h }, hmacKey)
-	macWriter := io.MultiWriter(outFile, mac)
-
-	if _, err := macWriter.Write(headerBuf.Bytes()); err != nil {
+	if _, err := outFile.Write(headerBuf.Bytes()); err != nil {
 		return fmt.Errorf("failed to write header: %w", err)
 	}
-
-	if err := qe.processStream(inFile, macWriter, encryptionKey, nonce); err != nil {
-		return fmt.Errorf("stream processing failed during encryption: %w", err)
-	}
-
-	if _, err := outFile.Write(mac.Sum(nil)); err != nil {
-		return fmt.Errorf("failed to write HMAC: %w", err)
-	}
-	if _, err := outFile.Write(hmacInfo); err != nil {
-		return fmt.Errorf("failed to write HMAC info: %w", err)
-	}
-
-	return nil
+	return qe.processStream(inFile, outFile, encryptionKey, nonce, true)
 }
 
 func (qe *QuantumEngine) DecryptFile(inputFile, outputFile, privateKeyFile string) (err error) {
@@ -675,43 +636,14 @@ func (qe *QuantumEngine) DecryptFile(inputFile, outputFile, privateKeyFile strin
 		return fmt.Errorf("failed to open input file: %w", err)
 	}
 	defer inFile.Close()
-
-	fileInfo, err := inFile.Stat()
-	if err != nil {
-		return err
-	}
-	fileSize := fileInfo.Size()
-	if fileSize < (Blake2sHashSize + HmacInfoSize) {
-		return fmt.Errorf("input file is too small to be valid")
-	}
-
-	hmacInfo := make([]byte, HmacInfoSize)
-	if _, err := inFile.ReadAt(hmacInfo, fileSize-HmacInfoSize); err != nil {
-		return fmt.Errorf("failed to read HMAC info: %w", err)
-	}
-	expectedHMAC := make([]byte, Blake2sHashSize)
-	if _, err := inFile.ReadAt(expectedHMAC, fileSize-Blake2sHashSize-HmacInfoSize); err != nil {
-		return fmt.Errorf("failed to read expected HMAC: %w", err)
-	}
-
-	if _, err := inFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek to start of input file: %w", err)
-	}
-
 	header, headerSize, err := qe.loadEncryptedHeader(inFile)
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted header: %w", err)
 	}
-
 	encryptionKey, err := qe.HybridDecapsulate(privateKeyPair, header)
 	if err != nil {
 		return err
 	}
-	hmacKey, err := deriveKeyBLAKE2s(encryptionKey, hmacInfo)
-	if err != nil {
-		return fmt.Errorf("failed to derive HMAC key: %w", err)
-	}
-
 	outTmpFile, err := os.Create(outputFile + ".tmp")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary output file: %w", err)
@@ -722,35 +654,18 @@ func (qe *QuantumEngine) DecryptFile(inputFile, outputFile, privateKeyFile strin
 			os.Remove(outputFile + ".tmp")
 		}
 	}()
-
-	mac := hmac.New(func() hash.Hash { h, _ := blake2s.New256(nil); return h }, hmacKey)
-	if _, err := inFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek for verification: %w", err)
+	if _, err := inFile.Seek(headerSize, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to content start: %w", err)
 	}
-	if _, err := io.CopyN(mac, inFile, headerSize); err != nil {
-		return fmt.Errorf("failed to hash header for verification: %w", err)
-	}
-
-	contentLength := fileSize - headerSize - Blake2sHashSize - HmacInfoSize
-	verifyingReader := io.TeeReader(io.LimitReader(inFile, contentLength), mac)
-
-	err = qe.processStream(verifyingReader, outTmpFile, encryptionKey, header.Nonce)
-	if err != nil {
+	if err := qe.processStream(inFile, outTmpFile, encryptionKey, header.Nonce, false); err != nil {
 		return err
 	}
-
-	computedHMAC := mac.Sum(nil)
-	if !hmac.Equal(computedHMAC, expectedHMAC) {
-		return fmt.Errorf("file integrity verification failed: HMAC mismatch")
-	}
-
 	if err := outTmpFile.Close(); err != nil {
 		return fmt.Errorf("failed to close temporary file: %w", err)
 	}
 	if err := os.Rename(outputFile+".tmp", outputFile); err != nil {
 		return fmt.Errorf("failed to rename temporary file: %w", err)
 	}
-
 	return nil
 }
 
@@ -799,7 +714,6 @@ func (qe *QuantumEngine) benchmarkOperation(op, testFile, keyFile string, fileSi
 	duration := time.Since(startTime)
 	endMem := getMemoryUsage()
 	os.Remove(outputFile)
-
 	throughput := 0.0
 	if duration > 0 {
 		throughput = float64(fileSize) / duration.Seconds() / (1024 * 1024)
@@ -808,7 +722,6 @@ func (qe *QuantumEngine) benchmarkOperation(op, testFile, keyFile string, fileSi
 	if qe.useMLKEM {
 		algorithm = "ML-KEM"
 	}
-
 	result := BenchmarkResult{
 		Operation:     "Hybrid " + op,
 		FileSize:      fileSize,
@@ -817,7 +730,7 @@ func (qe *QuantumEngine) benchmarkOperation(op, testFile, keyFile string, fileSi
 		MemoryUsed:    endMem - startMem,
 		Success:       err == nil,
 		SecurityLevel: qe.securityLevel.String(),
-		Algorithm:     fmt.Sprintf("Hybrid %s+X25519+XChaCha20", algorithm),
+		Algorithm:     fmt.Sprintf("Hybrid %s+X25519+XChaCha20-Poly1305", algorithm),
 	}
 	if err != nil {
 		result.Error = err.Error()
@@ -828,16 +741,14 @@ func (qe *QuantumEngine) benchmarkOperation(op, testFile, keyFile string, fileSi
 func (qe *QuantumEngine) runStressTest(config StressTestConfig) {
 	fmt.Printf("\n🚀 **Post-Quantum Stream Encryption Stress Test**\n")
 	fmt.Printf("==================================================\n")
-	fmt.Printf("Hybrid KEM: ML-KEM/Kyber + X25519 | Stream Cipher: XChaCha20\n")
-	fmt.Printf("Hash: BLAKE2s | Integrity: HMAC-BLAKE2s (Header + Ciphertext)\n")
+	fmt.Printf("Hybrid KEM: ML-KEM/Kyber + X25519 | Stream Cipher: XChaCha20-Poly1305 AEAD\n")
+	fmt.Printf("Hash: BLAKE2s | Integrity: Built-in Poly1305 Authentication\n")
 	fmt.Printf("Concurrency: %d threads | CPU Cores: %d | Go Version: %s\n\n", config.Concurrency, runtime.NumCPU(), runtime.Version())
-
 	for _, secLevel := range config.SecurityLevels {
 		for _, useMLKEM := range []bool{true, false} {
 			if useMLKEM && secLevel == Level128 {
 				continue
 			}
-
 			engine := NewQuantumEngine(secLevel, useMLKEM)
 			algorithm := "Kyber"
 			if useMLKEM {
@@ -845,7 +756,6 @@ func (qe *QuantumEngine) runStressTest(config StressTestConfig) {
 			}
 			fmt.Printf("\n🔒 **Testing %s Security (%s)**\n", secLevel.String(), algorithm)
 			fmt.Printf("=================================\n")
-
 			keyBaseName := fmt.Sprintf("stress_test_%s_%s", secLevel.String(), algorithm)
 			keyPair, err := engine.GenerateHybridKeyPair()
 			if err != nil {
@@ -860,7 +770,6 @@ func (qe *QuantumEngine) runStressTest(config StressTestConfig) {
 				defer os.Remove(keyBaseName + KeyExt)
 				defer os.Remove(keyBaseName + PubKeyExt)
 			}
-
 			for _, fileSize := range config.FileSizes {
 				fmt.Printf("\n--- Testing %s files ---\n", formatBytes(fileSize))
 				testFile := fmt.Sprintf("test_%s.dat", formatBytes(fileSize))
@@ -871,9 +780,8 @@ func (qe *QuantumEngine) runStressTest(config StressTestConfig) {
 				}
 				fmt.Printf(" ✓\n")
 				encryptedFile := testFile + ".enc"
-
 				encResult := engine.benchmarkOperation("encrypt", testFile, keyBaseName+PubKeyExt, fileSize)
-				fmt.Printf("Stream encryption...")
+				fmt.Printf("AEAD encryption...")
 				if encResult.Success {
 					fmt.Printf(" ✓ %.2f MB/s\n", encResult.Throughput)
 				} else {
@@ -881,21 +789,18 @@ func (qe *QuantumEngine) runStressTest(config StressTestConfig) {
 					os.Remove(testFile)
 					continue
 				}
-
 				if err := engine.EncryptFile(testFile, encryptedFile, keyBaseName+PubKeyExt); err != nil {
 					log.Printf("FAIL: Could not create file for decryption benchmark: %v", err)
 					os.Remove(testFile)
 					continue
 				}
-
 				decResult := engine.benchmarkOperation("decrypt", encryptedFile, keyBaseName+KeyExt, fileSize)
-				fmt.Printf("Stream decryption...")
+				fmt.Printf("AEAD decryption...")
 				if decResult.Success {
 					fmt.Printf(" ✓ %.2f MB/s\n", decResult.Throughput)
 				} else {
 					fmt.Printf(" ✗ %s\n", decResult.Error)
 				}
-
 				if config.CleanupFiles {
 					os.Remove(testFile)
 					os.Remove(encryptedFile)
@@ -903,7 +808,7 @@ func (qe *QuantumEngine) runStressTest(config StressTestConfig) {
 			}
 		}
 	}
-	fmt.Printf("\n✅ **Streaming Encryption Test Completed!**\n")
+	fmt.Printf("\n✅ **XChaCha20-Poly1305 AEAD Test Completed!**\n")
 }
 
 func main() {
@@ -921,13 +826,11 @@ func main() {
 		help          = flag.Bool("help", false, "Show help message")
 	)
 	flag.Parse()
-
 	if *help || (len(os.Args) == 1 && !*benchmark) {
-		fmt.Println("Post-Quantum Secure Stream Encryption Engine (v3.3-revised)")
+		fmt.Println("Post-Quantum Secure Stream Encryption Engine (v4.0-AEAD)")
 		flag.PrintDefaults()
 		return
 	}
-
 	var level SecurityLevel
 	switch *securityLevel {
 	case "128":
@@ -940,14 +843,11 @@ func main() {
 	default:
 		log.Fatalf("Invalid security level: %s (use 128, 192, or 256)", *securityLevel)
 	}
-
 	if *useMLKEM && level == Level128 {
 		log.Printf("Warning: ML-KEM-512 not supported, falling back to Kyber512")
 		*useMLKEM = false
 	}
-
 	engine := NewQuantumEngine(level, *useMLKEM)
-
 	switch {
 	case *benchmark:
 		config := StressTestConfig{
@@ -957,7 +857,6 @@ func main() {
 			SecurityLevels: []SecurityLevel{Level192, Level256},
 		}
 		engine.runStressTest(config)
-
 	case *generateKeys:
 		keyPair, err := engine.GenerateHybridKeyPair()
 		if err != nil {
@@ -966,7 +865,6 @@ func main() {
 		if err := engine.SaveHybridKeys(keyPair, *keyName); err != nil {
 			log.Fatalf("Failed to save keys: %v", err)
 		}
-
 	case *encrypt != "":
 		if *publicKey == "" {
 			*publicKey = *keyName + PubKeyExt
@@ -979,8 +877,7 @@ func main() {
 		if err := engine.EncryptFile(*encrypt, outputFile, *publicKey); err != nil {
 			log.Fatalf("Encryption failed: %v", err)
 		}
-		fmt.Println("Encryption successful.")
-
+		fmt.Println("XChaCha20-Poly1305 AEAD encryption successful.")
 	case *decrypt != "":
 		if *privateKey == "" {
 			*privateKey = *keyName + KeyExt
@@ -998,8 +895,7 @@ func main() {
 		if err := engine.DecryptFile(*decrypt, outputFile, *privateKey); err != nil {
 			log.Fatalf("Decryption failed: %v", err)
 		}
-		fmt.Println("Decryption and integrity verification successful.")
-
+		fmt.Println("XChaCha20-Poly1305 AEAD decryption and integrity verification successful.")
 	default:
 		fmt.Println("No action specified. Use -help for usage information.")
 	}
