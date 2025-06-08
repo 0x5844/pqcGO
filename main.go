@@ -505,8 +505,8 @@ func (bc *byteCounter) Read(p []byte) (n int, err error) {
 }
 
 func (qe *QuantumEngine) processStream(r io.Reader, w io.Writer, key, nonce []byte, encrypt bool) error {
-	jobs := make(chan chunkJob, numWorkers*2)
-	results := make(chan chunkResult, numWorkers*2)
+	jobs := make(chan chunkJob, numWorkers*4)
+	results := make(chan chunkResult, numWorkers*4)
 	var wg sync.WaitGroup
 
 	for i := 0; i < numWorkers; i++ {
@@ -565,13 +565,8 @@ func (qe *QuantumEngine) processStream(r io.Reader, w io.Writer, key, nonce []by
 		if n > 0 {
 			jobData := make([]byte, n)
 			copy(jobData, buffer[:n])
-			select {
-			case jobs <- chunkJob{id: chunkID, data: jobData, encrypt: encrypt}:
-				chunkID++
-			case <-time.After(time.Second):
-				writeErr = fmt.Errorf("timeout sending chunk job")
-				break
-			}
+			jobs <- chunkJob{id: chunkID, data: jobData, encrypt: encrypt}
+			chunkID++
 		}
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
