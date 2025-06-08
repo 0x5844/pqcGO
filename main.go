@@ -18,6 +18,7 @@ import (
 	"crypto/mlkem"
 
 	kyber "github.com/kudelskisecurity/crystals-go/crystals-kyber"
+	"github.com/pierrec/lz4/v4"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -87,14 +88,16 @@ type HybridKeyPair struct {
 }
 
 type QuantumEngine struct {
-	securityLevel SecurityLevel
-	useMLKEM      bool
+	securityLevel    SecurityLevel
+	useMLKEM         bool
+	compressionLevel int
 }
 
 type EncryptedHeader struct {
 	Version           uint32
 	SecurityLevel     uint32
 	UseMLKEM          bool
+	CompressionLevel  int32
 	MLKEMCiphertext   []byte
 	X25519PublicKey   []byte
 	KyberCiphertext   []byte
@@ -115,11 +118,12 @@ type BenchmarkResult struct {
 }
 
 type StressTestConfig struct {
-	FileSizes      []int64
-	Iterations     int
-	Concurrency    int
-	CleanupFiles   bool
-	SecurityLevels []SecurityLevel
+	FileSizes        []int64
+	Iterations       int
+	Concurrency      int
+	CleanupFiles     bool
+	SecurityLevels   []SecurityLevel
+	CompressionLevel int
 }
 
 type chunkJob struct {
@@ -145,10 +149,11 @@ func generateSecureRandomString(length int) ([]byte, error) {
 	return randomBytes, nil
 }
 
-func NewQuantumEngine(level SecurityLevel, preferMLKEM bool) *QuantumEngine {
+func NewQuantumEngine(level SecurityLevel, preferMLKEM bool, compressionLevel int) *QuantumEngine {
 	return &QuantumEngine{
-		securityLevel: level,
-		useMLKEM:      preferMLKEM,
+		securityLevel:    level,
+		useMLKEM:         preferMLKEM,
+		compressionLevel: compressionLevel,
 	}
 }
 
@@ -359,9 +364,10 @@ func (qe *QuantumEngine) LoadHybridPrivateKey(filename string) (*HybridKeyPair, 
 
 func (qe *QuantumEngine) HybridEncapsulate(publicKeyPair *HybridKeyPair) (*EncryptedHeader, []byte, error) {
 	header := &EncryptedHeader{
-		Version:       FileFormatVersion,
-		SecurityLevel: uint32(publicKeyPair.SecurityLevel),
-		UseMLKEM:      publicKeyPair.UseMLKEM,
+		Version:          FileFormatVersion,
+		SecurityLevel:    uint32(publicKeyPair.SecurityLevel),
+		UseMLKEM:         publicKeyPair.UseMLKEM,
+		CompressionLevel: int32(qe.compressionLevel),
 	}
 	derivationContext, err := generateSecureRandomString(DerivationContextSize)
 	if err != nil {
@@ -453,6 +459,7 @@ func (qe *QuantumEngine) saveEncryptedHeader(w io.Writer, header *EncryptedHeade
 	binary.Write(w, binary.BigEndian, header.Version)
 	binary.Write(w, binary.BigEndian, header.SecurityLevel)
 	binary.Write(w, binary.BigEndian, header.UseMLKEM)
+	binary.Write(w, binary.BigEndian, header.CompressionLevel)
 	if err := writeBytesWithLength(w, header.MLKEMCiphertext); err != nil {
 		return err
 	}
@@ -475,6 +482,7 @@ func (qe *QuantumEngine) loadEncryptedHeader(r io.Reader) (*EncryptedHeader, int
 	binary.Read(startCounter, binary.BigEndian, &header.Version)
 	binary.Read(startCounter, binary.BigEndian, &header.SecurityLevel)
 	binary.Read(startCounter, binary.BigEndian, &header.UseMLKEM)
+	binary.Read(startCounter, binary.BigEndian, &header.CompressionLevel)
 	if header.MLKEMCiphertext, err = readBytesWithLength(startCounter); err != nil {
 		return nil, 0, err
 	}
@@ -618,7 +626,70 @@ func (qe *QuantumEngine) EncryptFile(inputFile, outputFile, publicKeyFile string
 	if _, err := outFile.Write(headerBuf.Bytes()); err != nil {
 		return fmt.Errorf("failed to write header: %w", err)
 	}
-	return qe.processStream(inFile, outFile, encryptionKey, nonce, true)
+
+	if qe.compressionLevel < 0 {
+		return qe.processStream(inFile, outFile, encryptionKey, nonce, true)
+	}
+
+	pr, pw := io.Pipe()
+	errChan := make(chan error, 1)
+
+	go func() {
+		defer pw.Close()
+		lz4Writer := lz4.NewWriter(pw)
+		if err := lz4Writer.Apply(lz4.CompressionLevelOption(qe.getCompressionLevelOption(qe.compressionLevel))); err != nil {
+			errChan <- fmt.Errorf("failed to set compression level: %w", err)
+			return
+		}
+		if _, err := io.Copy(lz4Writer, inFile); err != nil {
+			errChan <- fmt.Errorf("compression failed: %w", err)
+			return
+		}
+		if err := lz4Writer.Close(); err != nil {
+			errChan <- fmt.Errorf("failed to close lz4 writer: %w", err)
+			return
+		}
+		errChan <- nil
+	}()
+
+	streamErr := qe.processStream(pr, outFile, encryptionKey, nonce, true)
+	compressErr := <-errChan
+
+	if streamErr != nil {
+		return fmt.Errorf("encryption stream failed: %w", streamErr)
+	}
+	if compressErr != nil {
+		return fmt.Errorf("compression stage failed: %w", compressErr)
+	}
+
+	return nil
+}
+
+func (qe *QuantumEngine) getCompressionLevelOption(level int) lz4.CompressionLevel {
+	switch level {
+	case 0:
+		return lz4.Fast
+	case 1:
+		return lz4.Level1
+	case 2:
+		return lz4.Level2
+	case 3:
+		return lz4.Level3
+	case 4:
+		return lz4.Level4
+	case 5:
+		return lz4.Level5
+	case 6:
+		return lz4.Level6
+	case 7:
+		return lz4.Level7
+	case 8:
+		return lz4.Level8
+	case 9:
+		return lz4.Level9
+	default:
+		return lz4.Fast
+	}
 }
 
 func (qe *QuantumEngine) DecryptFile(inputFile, outputFile, privateKeyFile string) (err error) {
@@ -652,9 +723,33 @@ func (qe *QuantumEngine) DecryptFile(inputFile, outputFile, privateKeyFile strin
 	if _, err := inFile.Seek(headerSize, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek to content start: %w", err)
 	}
-	if err := qe.processStream(inFile, outTmpFile, encryptionKey, header.Nonce, false); err != nil {
-		return err
+
+	if header.CompressionLevel < 0 {
+		if err := qe.processStream(inFile, outTmpFile, encryptionKey, header.Nonce, false); err != nil {
+			return err
+		}
+	} else {
+		pr, pw := io.Pipe()
+		errChan := make(chan error, 1)
+
+		go func() {
+			defer pw.Close()
+			err := qe.processStream(inFile, pw, encryptionKey, header.Nonce, false)
+			errChan <- err
+		}()
+
+		lz4Reader := lz4.NewReader(pr)
+		_, copyErr := io.Copy(outTmpFile, lz4Reader)
+
+		streamErr := <-errChan
+		if streamErr != nil {
+			return fmt.Errorf("decryption stream failed: %w", streamErr)
+		}
+		if copyErr != nil {
+			return fmt.Errorf("decompression failed: %w", copyErr)
+		}
 	}
+
 	if err := outTmpFile.Close(); err != nil {
 		return fmt.Errorf("failed to close temporary file: %w", err)
 	}
@@ -738,13 +833,13 @@ func (qe *QuantumEngine) runStressTest(config StressTestConfig) {
 	fmt.Printf("==================================================\n")
 	fmt.Printf("Hybrid KEM: ML-KEM/Kyber + X25519 | Stream Cipher: XChaCha20-Poly1305 AEAD\n")
 	fmt.Printf("Hash: BLAKE2s | Integrity: Built-in Poly1305 Authentication\n")
-	fmt.Printf("Concurrency: %d threads | CPU Cores: %d | Go Version: %s\n\n", config.Concurrency, runtime.NumCPU(), runtime.Version())
+	fmt.Printf("Concurrency: %d threads | CPU Cores: %d | Go Version: %s | Compression Level: %d\n", config.Concurrency, runtime.NumCPU(), runtime.Version(), config.CompressionLevel)
 	for _, secLevel := range config.SecurityLevels {
 		for _, useMLKEM := range []bool{true, false} {
 			if useMLKEM && secLevel == Level128 {
 				continue
 			}
-			engine := NewQuantumEngine(secLevel, useMLKEM)
+			engine := NewQuantumEngine(secLevel, useMLKEM, qe.compressionLevel)
 			algorithm := "Kyber"
 			if useMLKEM {
 				algorithm = "ML-KEM"
@@ -818,6 +913,7 @@ func main() {
 		benchmark     = flag.Bool("benchmark", false, "Run performance benchmark and stress test")
 		securityLevel = flag.String("level", "192", "Security level: 128, 192, or 256 bits")
 		useMLKEM      = flag.Bool("mlkem", true, "Use Go 1.24+ ML-KEM (vs legacy Kyber)")
+		compressLevel = flag.Int("compress-level", 4, "LZ4 compression level (0=fastest, 9=best). Use -1 to disable.")
 		help          = flag.Bool("help", false, "Show help message")
 	)
 	flag.Parse()
@@ -842,14 +938,19 @@ func main() {
 		log.Printf("Warning: ML-KEM-512 not supported, falling back to Kyber512")
 		*useMLKEM = false
 	}
-	engine := NewQuantumEngine(level, *useMLKEM)
+	if *compressLevel > 9 {
+		*compressLevel = 9
+	}
+
+	engine := NewQuantumEngine(level, *useMLKEM, *compressLevel)
 	switch {
 	case *benchmark:
 		config := StressTestConfig{
-			FileSizes:      []int64{10 * 1024, 1024 * 1024, 100 * 1024 * 1024, 1 * 1024 * 1024 * 1024},
-			Concurrency:    numWorkers,
-			CleanupFiles:   true,
-			SecurityLevels: []SecurityLevel{Level192, Level256},
+			FileSizes:        []int64{10 * 1024, 1024 * 1024, 100 * 1024 * 1024, 1 * 1024 * 1024 * 1024},
+			Concurrency:      numWorkers,
+			CleanupFiles:     true,
+			SecurityLevels:   []SecurityLevel{Level192, Level256},
+			CompressionLevel: *compressLevel,
 		}
 		engine.runStressTest(config)
 	case *generateKeys:
